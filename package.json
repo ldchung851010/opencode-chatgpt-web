@@ -1,32 +1,29 @@
 {
-  "name": "codex-chatgpt-web",
+  "name": "opencode-chatgpt-web",
   "version": "2.1.10",
   "private": true,
-  "description": "A focused local Responses bridge that runs Codex tasks through a user-authenticated ChatGPT web session.",
+  "description": "A local OpenAI Responses bridge that keeps OpenCode as the agent runtime while using a user-authenticated ChatGPT Web session for model inference.",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/miuuyy/codex-chatgpt-web.git"
+    "url": "git+https://github.com/ldchung851010/opencode-chatgpt-web.git"
   },
-  "homepage": "https://github.com/miuuyy/codex-chatgpt-web#readme",
+  "homepage": "https://github.com/ldchung851010/opencode-chatgpt-web#readme",
   "bugs": {
-    "url": "https://github.com/miuuyy/codex-chatgpt-web/issues"
+    "url": "https://github.com/ldchung851010/opencode-chatgpt-web/issues"
   },
   "packageManager": "bun@1.3.14",
   "type": "module",
   "bin": {
+    "opencode-chatgpt-web": "./src/cli.ts",
     "codex-chatgpt-web": "./src/cli.ts"
   },
-  "files": [
-    "dist",
-    "README.md",
-    "LICENSE",
-    "LICENSES"
-  ],
+  "files": ["dist", "README.md", "README-OPENCODE.md", "LICENSE", "LICENSES"],
   "scripts": {
     "start": "bun run src/cli.ts serve",
     "setup": "bun run src/cli.ts setup",
     "doctor": "bun run src/cli.ts doctor",
     "test": "bun test tests/*.test.ts",
+    "test:opencode": "node --experimental-strip-types --test tests/opencode-*.test.ts",
     "audit": "bun audit",
     "check-version": "bun run scripts/check-version.ts",
     "typecheck": "bunx tsc --noEmit",
@@ -60,21 +57,13 @@
     "@types/turndown": "5.0.5",
     "typescript": "5.9.3"
   },
-  "engines": {
-    "bun": "1.3.14"
-  },
+  "engines": { "bun": "1.3.14" },
   "overrides": {
     "@hono/node-server": "2.0.12",
     "fast-uri": "3.1.5",
     "hono": "4.12.34",
     "zod-to-json-schema": "3.25.1"
   },
-  "keywords": [
-    "codex",
-    "chatgpt",
-    "responses-api",
-    "mcp",
-    "playwright"
-  ],
+  "keywords": ["opencode", "chatgpt", "responses-api", "mcp", "playwright"],
   "license": "MIT"
 }

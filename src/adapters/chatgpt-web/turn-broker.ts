@@ -2,19 +2,18 @@ import { randomBytes } from "node:crypto";
 import { chmodSync, existsSync, lstatSync, mkdirSync, unlinkSync } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { dirname } from "node:path";
-import { isWindowsPipeEndpoint } from "../../config";
-import type { ChatGptTurnEnvironment } from "./environment";
+import type { OpenCodeTurnEnvironment } from "./tool-environment.ts";
+import { validateToolInvocation } from "./tool-environment.ts";
 
-interface PendingTurn extends ChatGptTurnEnvironment {
+interface PendingTurn extends OpenCodeTurnEnvironment {
   expiresAt?: number;
 }
 
 export interface BrokerToolRequest {
   callId: string;
-  wireName: string;
-  freeform: boolean;
-  arguments?: Record<string, unknown>;
-  input?: string;
+  name: string;
+  revision: string;
+  arguments: Record<string, unknown>;
 }
 
 export interface BrokerToolResult {
@@ -52,21 +51,26 @@ interface BrokerRequest {
   method: "claim" | "resolve" | "release" | "invoke";
   token?: string;
   bindingId?: string;
-  wireName?: string;
-  freeform?: boolean;
+  name?: string;
+  revision?: string;
   arguments?: Record<string, unknown>;
-  input?: string;
 }
 
 interface BrokerResponse {
   id: string;
   result?: unknown;
   error?: string;
+  code?: string;
 }
 
 const brokers = new Map<string, TurnBroker>();
 const MAX_BROKER_LINE_CHARS = 67_108_864;
 const MAX_RETIRED_TURN_HANDLES = 64;
+const TOOL_BATCH_WINDOW_MS = 15;
+
+function isWindowsPipeEndpoint(path: string): boolean {
+  return path.startsWith("\\\\.\\pipe\\") || path.startsWith("//./pipe/");
+}
 
 export async function closeTurnBrokers(): Promise<void> {
   const active = [...brokers.values()];
@@ -87,17 +91,27 @@ function errorOf(value: unknown): Error {
   return value instanceof Error ? value : new Error(String(value));
 }
 
-function retiredTurnLabel(traceId: string): string {
-  return traceId && traceId !== "unknown" ? `Codex turn ${traceId}` : "a Codex turn";
+function errorCode(value: unknown): string | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const code = (value as { code?: unknown }).code;
+  return typeof code === "string" ? code : undefined;
 }
 
-function environmentIdentity(environment: ChatGptTurnEnvironment): string {
-  return JSON.stringify({
-    cwd: environment.cwd,
-    roots: environment.roots,
-    writableRoots: environment.writableRoots,
-    sandboxPolicy: environment.sandboxPolicy,
-  });
+function retiredTurnLabel(traceId: string): string {
+  return traceId && traceId !== "unknown" ? `OpenCode browser turn ${traceId}` : "an OpenCode browser turn";
+}
+
+function assertSameSession(current: OpenCodeTurnEnvironment, next: OpenCodeTurnEnvironment): void {
+  if (current.clientSessionId !== next.clientSessionId) {
+    throw new Error("OpenCode X-Session-Id changed during an active ChatGPT browser turn");
+  }
+  if (
+    current.parentSessionId !== undefined
+    && next.parentSessionId !== undefined
+    && current.parentSessionId !== next.parentSessionId
+  ) {
+    throw new Error("OpenCode parent session changed during an active ChatGPT browser turn");
+  }
 }
 
 export class TurnBroker {
@@ -113,27 +127,22 @@ export class TurnBroker {
   private readonly channels = new Map<string, TurnChannel>();
   private readonly pending = new Map<string, TurnChannel>();
   private readonly bindings = new Map<string, { token: string; channel: TurnChannel }>();
-  // The Codex context replayed into ChatGPT still carries the handles of finished turns, so a model
-  // can present one. Remembering which turn retired a handle is what separates "you are holding a
-  // previous turn's handle" from "this handle never existed".
   private readonly retiredBindings = new Map<string, string>();
   private readonly retiredTokens = new Map<string, string>();
   private server?: Server;
   private startPromise?: Promise<void>;
 
-  private constructor(readonly socketPath: string) {}
+  readonly socketPath: string;
 
-  /**
-   * A ChatGPT turn outlives the request that started it, and its Codex Native calls arrive from a
-   * separate MCP process. Creating the socket only once a turn registers leaves that process
-   * connecting to a path that does not exist yet, so an in-flight turn reports a filesystem error
-   * instead of the broker's own answer. The endpoint belongs to the runtime's lifetime.
-   */
+  private constructor(socketPath: string) {
+    this.socketPath = socketPath;
+  }
+
   async listen(): Promise<void> {
     await this.start();
   }
 
-  async register(environment: ChatGptTurnEnvironment, ttlMs?: number, traceId = "unknown"): Promise<string> {
+  async register(environment: OpenCodeTurnEnvironment, ttlMs?: number, traceId = "unknown"): Promise<string> {
     await this.start();
     this.prune();
     if (ttlMs !== undefined && (!Number.isFinite(ttlMs) || ttlMs <= 0)) {
@@ -155,13 +164,12 @@ export class TurnBroker {
     return token;
   }
 
-  updateEnvironment(token: string, environment: ChatGptTurnEnvironment): void {
+  /** Refresh the active OpenCode round. Tool registry/policy may change; session identity may not. */
+  updateEnvironment(token: string, environment: OpenCodeTurnEnvironment): void {
     this.prune();
     const channel = this.channels.get(token);
     if (!channel) throw new Error("turn token is invalid or expired");
-    if (environmentIdentity(channel.environment) !== environmentIdentity(environment)) {
-      throw new Error("Codex turn environment changed during an active ChatGPT tool loop");
-    }
+    assertSameSession(channel.environment, environment);
     channel.environment = {
       ...environment,
       ...(channel.environment.expiresAt !== undefined
@@ -196,9 +204,10 @@ export class TurnBroker {
     if (!channel) throw new Error("turn token is invalid or expired");
     const invocation = channel.invocations.get(callId);
     if (!invocation) throw new Error(`tool call is not pending: ${callId}`);
-    if (channel.queuedCallIds.includes(callId)) throw new Error(`tool call was completed before it was delivered: ${callId}`);
+    if (channel.queuedCallIds.includes(callId)) {
+      throw new Error(`tool call was completed before it was delivered: ${callId}`);
+    }
     channel.invocations.delete(callId);
-    console.info(`[chatgpt-web] broker trace=${channel.traceId} completed call=${callId.slice(0, 17)} pending=${channel.invocations.size}`);
     invocation.resolve(result);
   }
 
@@ -212,17 +221,7 @@ export class TurnBroker {
       this.retire(this.retiredBindings, channel.bindingId, channel.traceId);
     }
     this.retire(this.retiredTokens, token, channel.traceId);
-    this.rejectChannel(channel, new Error("Codex turn binding was revoked"));
-  }
-
-  private retire(history: Map<string, string>, handle: string, traceId: string): void {
-    history.delete(handle);
-    history.set(handle, traceId);
-    while (history.size > MAX_RETIRED_TURN_HANDLES) {
-      const oldest = history.keys().next();
-      if (oldest.done) return;
-      history.delete(oldest.value);
-    }
+    this.rejectChannel(channel, new Error("OpenCode turn binding was revoked"));
   }
 
   async close(): Promise<void> {
@@ -242,6 +241,16 @@ export class TurnBroker {
       && lstatSync(this.socketPath).isSocket()) unlinkSync(this.socketPath);
   }
 
+  private retire(history: Map<string, string>, handle: string, traceId: string): void {
+    history.delete(handle);
+    history.set(handle, traceId);
+    while (history.size > MAX_RETIRED_TURN_HANDLES) {
+      const oldest = history.keys().next();
+      if (oldest.done) return;
+      history.delete(oldest.value);
+    }
+  }
+
   private start(): Promise<void> {
     if (this.startPromise) return this.startPromise;
     this.startPromise = new Promise<void>((resolveStart, rejectStart) => {
@@ -252,9 +261,7 @@ export class TurnBroker {
         this.server = server;
         server.once("error", rejectStart);
         server.on("error", error => {
-          console.error(
-            `[chatgpt-web] turn broker server error at ${this.socketPath}: ${errorOf(error).message}`,
-          );
+          console.error(`[chatgpt-web] turn broker server error at ${this.socketPath}: ${errorOf(error).message}`);
         });
         server.listen(this.socketPath, () => {
           server.off("error", rejectStart);
@@ -296,28 +303,22 @@ export class TurnBroker {
       probe.setTimeout(2_000, () => finishProbe(() => {
         rejectStart(new Error(`Timed out while checking existing ChatGPT web broker socket: ${this.socketPath}`));
       }));
-      probe.once("connect", () => {
-        finishProbe(() => {
-          rejectStart(new Error(`ChatGPT web broker socket is already owned by another process: ${this.socketPath}`));
-        });
-      });
-      probe.once("error", error => {
-        finishProbe(() => {
-          const code = (error as NodeJS.ErrnoException).code;
-          if (code !== "ECONNREFUSED" && code !== "ENOENT") {
-            rejectStart(new Error(
-              `Could not verify existing ChatGPT web broker socket ${this.socketPath}: ${error.message}`,
-            ));
-            return;
-          }
-          try {
-            if (existsSync(this.socketPath)) unlinkSync(this.socketPath);
-            listen();
-          } catch (cleanupError) {
-            rejectStart(errorOf(cleanupError));
-          }
-        });
-      });
+      probe.once("connect", () => finishProbe(() => {
+        rejectStart(new Error(`ChatGPT web broker socket is already owned by another process: ${this.socketPath}`));
+      }));
+      probe.once("error", error => finishProbe(() => {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== "ECONNREFUSED" && code !== "ENOENT") {
+          rejectStart(new Error(`Could not verify existing ChatGPT web broker socket ${this.socketPath}: ${error.message}`));
+          return;
+        }
+        try {
+          if (existsSync(this.socketPath)) unlinkSync(this.socketPath);
+          listen();
+        } catch (cleanupError) {
+          rejectStart(errorOf(cleanupError));
+        }
+      }));
     });
     return this.startPromise;
   }
@@ -345,12 +346,16 @@ export class TurnBroker {
         request = JSON.parse(line) as BrokerRequest;
         this.validateRequest(request);
       } catch (error) {
-        this.writeSocketResponse(socket, { id: request?.id ?? "unknown", error: errorOf(error).message });
+        const parsed = errorOf(error);
+        this.writeSocketResponse(socket, { id: request?.id ?? "unknown", error: parsed.message, ...(errorCode(error) ? { code: errorCode(error) } : {}) });
         return;
       }
       void Promise.resolve().then(() => this.dispatch(request!)).then(
         result => this.writeSocketResponse(socket, { id: request!.id, result }),
-        error => this.writeSocketResponse(socket, { id: request!.id, error: errorOf(error).message }),
+        error => {
+          const parsed = errorOf(error);
+          this.writeSocketResponse(socket, { id: request!.id, error: parsed.message, ...(errorCode(error) ? { code: errorCode(error) } : {}) });
+        },
       );
     });
   }
@@ -380,14 +385,9 @@ export class TurnBroker {
       if (typeof token !== "string" || token.length === 0) throw new Error("turn token is required");
       const channel = this.channels.get(token);
       const retiredTurn = channel ? undefined : this.retiredTokens.get(token);
-      console.error(
-        `[chatgpt-web] broker claim received (tokenChars=${token.length}, valid=${Boolean(channel)}`
-        + `${channel ? "" : `, retiredTurn=${retiredTurn ?? "unknown"}`})`,
-      );
       if (!channel) {
         throw new Error(retiredTurn !== undefined
           ? `This turn_token was issued for ${retiredTurnLabel(retiredTurn)}, which has already finished.`
-          + " This Codex Native action can no longer run."
           : "turn token is invalid, expired, or revoked");
       }
       if (channel.bindingId) {
@@ -409,13 +409,9 @@ export class TurnBroker {
     const binding = this.bindings.get(bindingId);
     if (!binding) {
       const retiredTurn = this.retiredBindings.get(bindingId);
-      console.error(
-        `[chatgpt-web] broker rejected ${request.method} (binding=${bindingId.slice(0, 17)},`
-        + ` retiredTurn=${retiredTurn ?? "unknown"})`,
-      );
       throw new Error(retiredTurn !== undefined
-        ? `${retiredTurnLabel(retiredTurn)} has already finished; this Codex Native action can no longer run.`
-        : "internal Codex turn binding is invalid or expired");
+        ? `${retiredTurnLabel(retiredTurn)} has already finished; this OpenCode Native action can no longer run.`
+        : "internal OpenCode turn binding is invalid or expired");
     }
     if (request.method === "release") {
       this.revoke(binding.token);
@@ -423,21 +419,24 @@ export class TurnBroker {
     }
     if (request.method === "resolve") return { environment: binding.channel.environment };
 
-    const wireName = request.wireName?.trim();
-    if (!wireName) throw new Error("wire tool name is required");
+    const name = request.name?.trim();
+    if (!name) throw new Error("tool name is required");
+    const revision = request.revision?.trim();
+    if (!revision) throw new Error("tool revision is required");
+    const args = request.arguments ?? {};
+    if (!args || typeof args !== "object" || Array.isArray(args)) throw new Error("tool arguments must be an object");
+
+    validateToolInvocation(
+      binding.channel.environment,
+      { name, revision },
+      binding.channel.invocations.size,
+    );
+
     const callId = opaqueId("call");
-    const toolRequest: BrokerToolRequest = {
-      callId,
-      wireName,
-      freeform: request.freeform === true,
-      ...(request.freeform === true ? { input: request.input ?? "" } : { arguments: request.arguments ?? {} }),
-    };
+    const toolRequest: BrokerToolRequest = { callId, name, revision, arguments: args };
     return new Promise<BrokerToolResult>((resolveInvoke, rejectInvoke) => {
       binding.channel.invocations.set(callId, { request: toolRequest, resolve: resolveInvoke, reject: rejectInvoke });
       binding.channel.queuedCallIds.push(callId);
-      console.info(
-        `[chatgpt-web] broker trace=${binding.channel.traceId} queued call=${callId.slice(0, 17)} tool=${wireName} waiters=${binding.channel.waiters.size}`,
-      );
       this.scheduleToolWaiters(binding.channel);
     });
   }
@@ -453,15 +452,12 @@ export class TurnBroker {
     channel.batchTimer = setTimeout(() => {
       channel.batchTimer = undefined;
       this.wakeToolWaiters(channel);
-    }, 15);
+    }, TOOL_BATCH_WINDOW_MS);
   }
 
   private wakeToolWaiters(channel: TurnChannel): void {
     if (channel.queuedCallIds.length === 0 || channel.waiters.size === 0) return;
     const batch = this.takeQueued(channel);
-    console.info(
-      `[chatgpt-web] broker trace=${channel.traceId} delivered calls=${batch.length} tools=${batch.map(request => request.wireName).join(",")}`,
-    );
     const waiters = [...channel.waiters];
     channel.waiters.clear();
     const first = waiters.shift();
@@ -497,12 +493,7 @@ export class TurnBroker {
   }
 }
 
-/**
- * A turn registered without a TTL has no deadline to bound its tool calls against, so a null
- * timeout waits for as long as the turn itself lives. Undefined keeps the bounded default, because
- * a caller that cannot compute a deadline must not silently inherit an unbounded wait. An
- * unbounded call still ends when the turn is revoked or the broker drops the connection.
- */
+/** Socket client used by the ChatGPT MCP connector process. */
 export async function callTurnBroker<T>(
   socketPath: string,
   request: Omit<BrokerRequest, "id">,
@@ -513,25 +504,45 @@ export async function callTurnBroker<T>(
     const socket = createConnection(socketPath);
     let buffered = "";
     let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+
+    const cleanup = () => {
+      if (timer) clearTimeout(timer);
+      socket.removeAllListeners();
+    };
     const finishError = (error: Error) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
+      cleanup();
       socket.destroy();
       rejectCall(error);
     };
-    const timer = timeoutMs === null
-      ? undefined
-      : setTimeout(() => finishError(new Error("ChatGPT web turn broker timed out")), timeoutMs);
+    const finishValue = (value: T) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      socket.end();
+      resolveCall(value);
+    };
+
+    if (timeoutMs !== null) {
+      if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+        finishError(new Error("turn broker timeout must be positive or null"));
+        return;
+      }
+      timer = setTimeout(() => finishError(new Error("turn broker request timed out")), timeoutMs);
+    }
+
     socket.setEncoding("utf8");
-    socket.once("error", error => finishError(new Error(`ChatGPT web turn broker unavailable: ${error.message}`)));
-    socket.once("close", () => finishError(new Error("ChatGPT web turn broker closed the connection")));
-    socket.once("connect", () => socket.write(`${JSON.stringify({ id, ...request })}\n`));
+    socket.once("error", finishError);
+    socket.once("connect", () => {
+      socket.write(`${JSON.stringify({ id, ...request })}\n`);
+    });
     socket.on("data", chunk => {
       if (settled) return;
       buffered += chunk;
       if (buffered.length > MAX_BROKER_LINE_CHARS) {
-        finishError(new Error("ChatGPT web turn broker response exceeds size limit"));
+        finishError(new Error("turn broker response exceeds size limit"));
         return;
       }
       const newline = buffered.indexOf("\n");
@@ -540,18 +551,20 @@ export async function callTurnBroker<T>(
       try {
         response = JSON.parse(buffered.slice(0, newline)) as BrokerResponse;
       } catch (error) {
-        finishError(new Error(`ChatGPT web turn broker returned invalid JSON: ${errorOf(error).message}`));
+        finishError(new Error(`invalid turn broker response: ${errorOf(error).message}`));
         return;
       }
       if (response.id !== id) {
-        finishError(new Error("ChatGPT web turn broker response id mismatch"));
+        finishError(new Error("turn broker response id mismatch"));
         return;
       }
-      settled = true;
-      clearTimeout(timer);
-      socket.end();
-      if (response.error) rejectCall(new Error(response.error));
-      else resolveCall(response.result as T);
+      if (response.error) {
+        const error = new Error(response.error) as Error & { code?: string };
+        if (response.code) error.code = response.code;
+        finishError(error);
+        return;
+      }
+      finishValue(response.result as T);
     });
   });
 }
