@@ -46,10 +46,8 @@ function roundEvidenceText(evidence: ChatGptWebRoundEvidence): string {
     ...(evidence.toolRequests ? {
       tool_calls: evidence.toolRequests.map(request => ({
         call_id: request.callId,
-        name: request.wireName,
-        ...(request.freeform
-          ? { input: request.input ?? "" }
-          : { arguments: request.arguments ?? {} }),
+        name: request.name,
+        arguments: request.arguments ?? {},
       })),
     } : {}),
   });
