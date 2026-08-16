@@ -53,7 +53,7 @@ const config = {
   host: "127.0.0.1",
   port,
   contextWindow: 256_000,
-  appName: "Codex Native",
+  appName: "OpenCode Native1",
   browserHost: "managed-chrome",
   chromeExecutablePath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
   storageStatePath: join(appHome, "browser", "storage-state.json"),
@@ -87,20 +87,25 @@ try {
     throw new Error(`unexpected health payload: ${JSON.stringify(payload)}`);
   }
 
-  const unauthenticatedModels = await fetch(`http://127.0.0.1:${port}/v1/models`);
-  const unauthenticatedModelsBody = await unauthenticatedModels.json() as { error?: { message?: string } };
-  if (unauthenticatedModels.status !== 502
-    || !unauthenticatedModelsBody.error?.message?.includes("incoming Bearer authorization")) {
-    throw new Error(`native model passthrough did not fail closed without Codex auth: ${JSON.stringify(unauthenticatedModelsBody)}`);
+  const models = await fetch(`http://127.0.0.1:${port}/v1/models`);
+  const modelsBody = await models.json() as {
+    object?: string;
+    data?: Array<{ id?: string; owned_by?: string }>;
+  };
+  const solModel = modelsBody.data?.find(model => model.id === "gpt-5.6-sol");
+  if (models.status !== 200
+    || modelsBody.object !== "list"
+    || solModel?.owned_by !== "chatgpt-web") {
+    throw new Error(`local OpenCode model catalog is invalid: ${JSON.stringify(modelsBody)}`);
   }
   const websocketNegotiation = await fetch(`http://127.0.0.1:${port}/v1/responses`);
   if (websocketNegotiation.status !== 426) {
-    throw new Error(`Responses WebSocket negotiation did not select Codex HTTP/SSE fallback: HTTP ${websocketNegotiation.status}`);
+    throw new Error(`Responses WebSocket negotiation did not select the local HTTP/SSE route: HTTP ${websocketNegotiation.status}`);
   }
   const invalid = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ model: "chatgpt-web/not-enabled", input: "test", stream: false }),
+    body: JSON.stringify({ model: "gpt-5.6-not-enabled", input: "test", stream: false }),
   });
   if (invalid.status !== 400) throw new Error(`unsupported model did not fail closed: HTTP ${invalid.status}`);
 
@@ -122,7 +127,7 @@ try {
   const rejectedWhileDraining = await fetch(`http://127.0.0.1:${port}/v1/responses`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ model: "chatgpt-web/high", reasoning: { effort: "high" }, input: "test", stream: false }),
+    body: JSON.stringify({ model: "gpt-5.6-sol", reasoning: { effort: "high" }, input: "test", stream: false }),
   });
   if (rejectedWhileDraining.status !== 503) {
     throw new Error(`daemon accepted a new turn while draining: HTTP ${rejectedWhileDraining.status}`);
