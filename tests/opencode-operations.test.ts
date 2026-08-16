@@ -5,6 +5,7 @@ import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 test("runtime configurator switches to a fresh OpenCode connector identity without touching tunnel authority", async () => {
   const dir = await mkdtemp(join(tmpdir(), "ocgw-config-"));
@@ -16,7 +17,7 @@ test("runtime configurator switches to a fresh OpenCode connector identity witho
   };
   await writeFile(path, JSON.stringify(original));
   try {
-    const script = new URL("../scripts/configure-opencode-runtime.py", import.meta.url).pathname;
+    const script = fileURLToPath(new URL("../scripts/configure-opencode-runtime.py", import.meta.url));
     const python = process.platform === "win32" ? "python" : "python3";
     const run = spawnSync(python, [script, path], { encoding: "utf8" });
     assert.equal(run.status, 0, run.stderr);
@@ -54,7 +55,7 @@ test("live smoke client performs R0 function_call then R1 function_call_output w
   const address = server.address();
   if (!address || typeof address === "string") throw new Error("test server address unavailable");
   try {
-    const script = new URL("../scripts/live-browser-smoke.mjs", import.meta.url).pathname;
+    const script = fileURLToPath(new URL("../scripts/live-browser-smoke.mjs", import.meta.url));
     const result = await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolveChild, rejectChild) => {
       const child = spawn(process.execPath, [script, file], {
         env: { ...process.env, OPENCODE_CHATGPT_WEB_BASE_URL: `http://127.0.0.1:${address.port}/v1` },
